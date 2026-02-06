@@ -1,5 +1,9 @@
+# This program was modified by Anupa Ragoonanan (n01423202)
+
 import socket
 import argparse
+import struct 
+from collections import OrderedDict
 
 def run_server(port, output_file):
     # 1. Create a UDP socket
@@ -11,8 +15,70 @@ def run_server(port, output_file):
     print(f"[*] Server will save each received file as 'received_<ip>_<port>.jpg' based on sender.")
     sock.bind(server_address)
 
+    # Packet reordering
+    expected_seq_num = 0
+    buffer = OrderedDict() # store out-of-order packets
+    received_data = bytearray()
+
     # 3. Keep listening for new transfers
     try:
+        while True:
+            data, addr = sock.recvfrom(2048)
+
+            # If we receive an empty packet, it means "End of File"
+            if not data:
+                continue
+            if len(data) < 4:
+                continue
+
+            seq_num = struct.unpack('!I', data[:4])[0]
+            packet_data = data[4:]
+
+            # check for EOF marker
+            if seq_num == 0xFFFFFFFF:
+                print(f"[*] End of file signal received from {addr}.")
+                # save the file
+                if received_data:
+                    with open(output_file, 'wb') as f:
+                        f.write(received_data)
+                    print(f"[*] File saved as '{output_file}'")
+                # Send ACK for EOF
+                ack_packet = struct.pack('!I', seq_num)
+                sock.sendto(ack_packet, addr)
+                # reset for next file
+                expected_seq_num = 0
+                buffer.clear()
+                received_data = bytearray()
+                continue
+                
+            # Send ACK for received packet
+            ack_packet = struct.pack('!I', seq_num)
+            sock.sendto(ack_packet, addr)
+
+            # Process packet based on sequence number
+            if seq_num == expected_seq_num:                
+                received_data.extend(packet_data)
+                expected_seq_num += 1
+                
+                # 2. VITAL STEP: Check if the *next* packet is already waiting in our buffer
+                while expected_seq_num in buffer:
+                    print(f"[*] Writing buffered packet seq {expected_seq_num} to file.")
+                    buffered_data = buffer.pop(expected_seq_num)
+                    received_data.extend(buffered_data) # skip sequence number in buffered packet
+                    expected_seq_num += 1
+                    
+            elif seq_num > expected_seq_num:
+                # Packet arrived too early (out of order). Store it for later.
+                if seq_num not in buffer:
+                    buffer[seq_num] = packet_data
+                    print(f"[*] Stored out-of-order packet seq {seq_num} in buffer.")
+                else:
+                    print(f"[*] Duplicate out-of-order packet seq {seq_num} received. Ignoring.")
+            else:
+                # Packet is old (duplicate). Ignore it.
+                print(f"[*] Duplicate packet seq {seq_num} received. Ignoring.")
+                pass
+        """
         while True:
             f = None
             sender_filename = None
@@ -37,6 +103,14 @@ def run_server(port, output_file):
             print("==== End of reception ====")
     except KeyboardInterrupt:
         print("\n[!] Server stopped manually.")
+        """
+    except KeyboardInterrupt:
+        print("\n[!] Server stopped manually.")
+        # save any incomplete file before exiting
+        if received_data:
+            with open(output_file, 'wb') as f:
+                f.write(received_data)
+            print(f"[*] Incomplete file saved as '{output_file}'")
     except Exception as e:
         print(f"[!] Error: {e}")
     finally:
@@ -49,9 +123,4 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="received_file.jpg", help="File path to save data")
     args = parser.parse_args()
 
-    try:
-        run_server(args.port, args.output)
-    except KeyboardInterrupt:
-        print("\n[!] Server stopped manually.")
-    except Exception as e:
-        print(f"[!] Error: {e}")
+    run_server(args.port, args.output)
